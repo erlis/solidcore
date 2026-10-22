@@ -27,6 +27,7 @@
 #include <SmVector3d.h>
 #include <nurbs.h>
 
+#include <cmath>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -186,6 +187,78 @@ void put_chars(std::vector<double>& o, const TCHAR* s)
 SmPolarConversion& polar(SmEllipse* e)
 {
     return e->*get(EllPolar());
+}
+
+// SmEllipse::AdjustSTEPInterval (SmEllipse.cpp:1905-1974, upstream commit c9c5979) VERBATIM,
+// apart from the SM_DEBUG_CODE block (not defined in the reference build) and the members
+// reached through accessors, plus the fix of tangency-labs/smlib 74bed94 (solidcore#428,
+// UB-251): an end of the new interval outside the current arc is not clamped to the arc's
+// ends by the polar converter. Outside a full-turn arc it is taken whole turns back into it
+// and its NURBS parameter moved by the NURBS length per turn (the other way for an inside-out
+// curve); outside a partial arc, the arc's NURBS interval continues in proportion to the
+// angle. The port has the fix, so OP_ADJUST runs this copy; the real AdjustSTEPInterval is no
+// longer exercised by this difftest, so re-diff this copy against upstream whenever the
+// pinned commit moves.
+SmStatus adjust_step_interval_fixed(SmEllipse* a, const SmExtent1d& crNewSTEPInterval)
+{
+    SmPolarConversion& m_vPolarConverter = polar(a);
+    const SmBoolean m_bInsideOut = a->*get(EllInsideOut());
+
+    // no work - new interval is same as old
+    if (crNewSTEPInterval.IsContainedBy(a->GetSTEPInterval(), SM_EFF_ZERO)
+        && a->GetSTEPInterval().IsContainedBy(crNewSTEPInterval, SM_EFF_ZERO))
+    {
+        return SM_SUCCESS;
+    }
+
+    // Locals to get the Nurbs parameters corresponding to the new STEP interval.
+    SmBoolean bExactConversion;
+    double dNurbsT0 = 0.0, dNurbsT1 = 0.0;
+    double dStepT0 = crNewSTEPInterval.GetMin();
+    double dStepT1 = crNewSTEPInterval.GetMax();
+
+    // After these calls, the conversion may not be reciprocal. Need to reparameterize
+    // (tangency-labs/smlib 74bed94: an angle outside the current arc, see above)
+    const SmExtent1d sOldSTEPIvl = a->GetSTEPInterval();
+    const SmExtent1d sOldNurbsIvl = a->GetNaturalInterval();
+    auto ConvertAngle = [&](double dStepT, double& rdNurbsT) -> SmStatus {
+        const double dSpan = sOldSTEPIvl.GetLength();
+        if (sOldSTEPIvl.ContainsValue(dStepT, SM_EFF_ZERO_DEG) || !(dSpan > SM_EFF_ZERO_DEG))
+        {
+            return m_vPolarConverter.ConvertToNURBSParameter(dStepT, rdNurbsT, bExactConversion);
+        }
+        const double dSign = m_bInsideOut ? -1.0 : 1.0;
+        if (std::fabs(dSpan - 360.0) < SM_EFF_ZERO_DEG)
+        {
+            double dTurns = std::floor((dStepT - sOldSTEPIvl.GetMin()) / 360.0);
+            double dInside = sOldSTEPIvl.ClampValue(dStepT - dTurns * 360.0);
+            SER(m_vPolarConverter.ConvertToNURBSParameter(dInside, rdNurbsT, bExactConversion));
+            rdNurbsT += dSign * dTurns * sOldNurbsIvl.GetLength();
+            return SM_SUCCESS;
+        }
+        double dFraction = (dStepT - sOldSTEPIvl.GetMin()) / dSpan;
+        rdNurbsT = m_bInsideOut ? sOldNurbsIvl.GetMax() - dFraction * sOldNurbsIvl.GetLength()
+                                : sOldNurbsIvl.GetMin() + dFraction * sOldNurbsIvl.GetLength();
+        return SM_SUCCESS;
+    };
+    SER(ConvertAngle(dStepT0, dNurbsT0));
+    SER(ConvertAngle(dStepT1, dNurbsT1));
+    SmExtent1d sNewNurbsIvl(dNurbsT0, dNurbsT1);
+
+    // save the input
+    SmExtent1d sNewDomain = crNewSTEPInterval;
+    a->SetSTEPInterval(sNewDomain);
+
+    a->Notify(SM_NO_PRE_EDIT, a, SM_NO_GET_OWNER(a), NULL);
+
+    SER(a->MakeNurb());
+
+    // MakeNurb() creates m_pNurb parameterized 0 -> 1   [B284]
+    a->SmBSplineCurve::EditParameterization(sNewNurbsIvl);
+
+    a->Notify(SM_NO_POST_EDIT, a, SM_NO_GET_OWNER(a), NULL);
+
+    return SM_SUCCESS;
 }
 
 void put_nurb(std::vector<double>& o, const SmBSplineCurve* c)
@@ -394,7 +467,7 @@ void run_op(int32_t op, Rd& rd, const SmContext& ctx, SmEllipse* a, std::vector<
     {
         double d0 = rd.num();
         double d1 = rd.num();
-        o.push_back(st(a->AdjustSTEPInterval(SmExtent1d(d0, d1))));
+        o.push_back(st(adjust_step_interval_fixed(a, SmExtent1d(d0, d1))));
         break;
     }
     case OP_GPS_STEP:

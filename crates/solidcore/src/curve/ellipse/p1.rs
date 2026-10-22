@@ -72,6 +72,11 @@
 //!   `dThetaYRad` reads the uninitialised second, and the port goes on), the 3-point circle of
 //!   collinear points) or index past a table (polar tables shorter than the knot
 //!   list), the port returns [`SolidError::InvalidInput`] (or the solver's status).
+//! - **A new STEP interval past the arc** (`AdjustSTEPInterval`, #428, UB-251): an end
+//!   outside the current arc is not clamped to the arc's ends by the polar converter,
+//!   as in tangency-labs/smlib 74bed94: a full-turn arc takes it whole turns back and
+//!   moves its NURB parameter by the NURB length per turn, a partial arc continues its
+//!   NURB interval in proportion. The difftest shim runs the same fixed copy.
 //! - **Statuses ignored upstream** stay ignored, except [`SolidError::Unported`],
 //!   which always propagates. `SmBoolean` values read from a database are taken as
 //!   `!= 0`.
@@ -1580,14 +1585,8 @@ impl Ellipse {
         let step_t1 = new_interval.max();
 
         // After these calls, the conversion may not be reciprocal.
-        let nurbs_t0 = self
-            .polar
-            .convert_to_nurbs_parameter(k, self, step_t0, 0.0)?
-            .0;
-        let nurbs_t1 = self
-            .polar
-            .convert_to_nurbs_parameter(k, self, step_t1, 0.0)?
-            .0;
+        let nurbs_t0 = self.convert_new_step_angle(k, step_t0)?;
+        let nurbs_t1 = self.convert_new_step_angle(k, step_t1)?;
         let new_nurbs_ivl = Extent1d::from_min_max(nurbs_t0, nurbs_t1);
 
         // save the input
@@ -1602,6 +1601,42 @@ impl Ellipse {
 
         // all done
         Ok(())
+    }
+
+    /// The NURB parameter of `step_t`, an end of [`Self::adjust_step_interval`]'s new
+    /// interval (tangency-labs/smlib 74bed94, #428). The polar converter knows only the
+    /// current arc and clamps an angle outside it to the arc's ends, so a full circle
+    /// moved to `[360, 540]` got one NURB parameter for both ends (NaN knots in the
+    /// surfaces of revolution built on it). Outside a full-turn arc, the angle is taken
+    /// whole turns back into it and its parameter moved by the NURB length per turn (the
+    /// other way for an inside-out curve); outside a partial arc, the arc's NURB interval
+    /// continues in proportion to the angle.
+    fn convert_new_step_angle(&self, k: &Kernel, step_t: f64) -> Result<f64> {
+        let old_step = self.anal_domain;
+        let old_nurbs = self.base.natural_interval();
+        let span = old_step.length();
+        if old_step.contains_value(step_t, EFF_ZERO_DEG) || !(span > EFF_ZERO_DEG) {
+            return Ok(self
+                .polar
+                .convert_to_nurbs_parameter(k, self, step_t, 0.0)?
+                .0);
+        }
+        let sign = if self.inside_out { -1.0 } else { 1.0 };
+        if (span - 360.0).abs() < EFF_ZERO_DEG {
+            let turns = ((step_t - old_step.min()) / 360.0).floor();
+            let inside = old_step.clamp_value(step_t - turns * 360.0);
+            let nurbs_t = self
+                .polar
+                .convert_to_nurbs_parameter(k, self, inside, 0.0)?
+                .0;
+            return Ok(nurbs_t + sign * turns * old_nurbs.length());
+        }
+        let fraction = (step_t - old_step.min()) / span;
+        Ok(if self.inside_out {
+            old_nurbs.max() - fraction * old_nurbs.length()
+        } else {
+            old_nurbs.min() + fraction * old_nurbs.length()
+        })
     }
 
     /// The points of the ellipse solving `operation` for `test_point`, as STEP angles
@@ -1973,6 +2008,44 @@ mod tests {
         let d = c.copy(&k).unwrap();
         assert!(d.approx_eq(&c));
         assert!(d.is_circle_class());
+    }
+
+    // #428 (tangency-labs/smlib 74bed94): a domain past the current arc is not clamped to it.
+    #[test]
+    fn a_step_interval_moved_past_the_arc_keeps_a_parameter_length() {
+        let k = kernel();
+        let near = |p: Point3, q: Point3| (p - q).length() < 1e-9;
+
+        // A full circle moved a turn on: half a turn, not one NURB parameter for both ends.
+        let mut c = circle(&k, 0.0, 360.0, 2.0);
+        let full = c.base().natural_interval();
+        c.adjust_step_interval(&k, &Extent1d::from_min_max(360.0, 540.0), None)
+            .unwrap();
+        let ivl = c.base().natural_interval();
+        assert!(ivl.min().is_finite() && ivl.max().is_finite());
+        assert!(ivl.length() > 0.25 * full.length(), "{ivl:?} of {full:?}");
+        let (knots, _) = c.base().knots(None).unwrap();
+        assert!(knots.iter().all(|u| u.is_finite()), "{knots:?}");
+        let at = |c: &Ellipse, s: f64| {
+            let t = c.convert_t_from_step_to_nurbs(&k, s).unwrap();
+            c.base().evaluate_point(t).unwrap()
+        };
+        assert!(near(at(&c, 360.0), Point3::new(3.0, 2.0, 3.0)));
+        assert!(near(at(&c, 450.0), Point3::new(1.0, 4.0, 3.0)));
+        assert!(near(at(&c, 540.0), Point3::new(-1.0, 2.0, 3.0)));
+        let mut l = AssertArray::new();
+        assert!(c
+            .assert_valid(&k, Some(&mut l), false, ObjectKey(1), ObjectKey(2))
+            .unwrap());
+
+        // A partial arc grown past its end: its NURB interval continues in proportion.
+        let mut a = circle(&k, 0.0, 90.0, 1.0);
+        let quarter = a.base().natural_interval();
+        a.adjust_step_interval(&k, &Extent1d::from_min_max(0.0, 180.0), None)
+            .unwrap();
+        let half = a.base().natural_interval();
+        assert!((half.min() - quarter.min()).abs() < 1e-12);
+        assert!((half.length() - 2.0 * quarter.length()).abs() < 1e-12);
     }
 
     #[test]
